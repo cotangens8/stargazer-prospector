@@ -51,9 +51,10 @@ def get_headers(include_starred_at: bool = False):
 
 def fetch_stargazers(repo: str, max_stargazers: int = 200) -> list[dict]:
     """
-    Fetch the most recent stargazers for a repo.
-    GitHub returns stargazers in chronological order (oldest first),
-    so we need to get the last pages to find recent ones.
+    Fetch recent stargazers for a repo.
+    
+    GitHub API limitation: Can only access first ~400 pages (40,000 stargazers).
+    For very popular repos, we fetch from the highest accessible pages.
     
     Returns list of {username, repo} dicts.
     """
@@ -62,7 +63,10 @@ def fetch_stargazers(repo: str, max_stargazers: int = 200) -> list[dict]:
     
     print(f"  Fetching stargazers for {repo}...")
     
-    # First, get the total count by checking the last page
+    # GitHub's max accessible page is around 400 (40,000 results limit)
+    MAX_ACCESSIBLE_PAGE = 400
+    
+    # First, get the total count by checking headers
     url = f"https://api.github.com/repos/{repo}/stargazers"
     response = requests.get(url, headers=get_headers(), params={"per_page": 1, "page": 1})
     
@@ -75,21 +79,26 @@ def fetch_stargazers(repo: str, max_stargazers: int = 200) -> list[dict]:
     last_page = 1
     
     if 'rel="last"' in link_header:
-        # Parse: <https://api.github.com/repos/.../stargazers?page=XX>; rel="last"
         import re
         match = re.search(r'page=(\d+)>; rel="last"', link_header)
         if match:
             last_page = int(match.group(1))
     
-    print(f"    Total pages: {last_page}")
+    print(f"    Total pages available: {last_page}")
     
-    # Fetch the last N pages to get recent stargazers
-    pages_to_fetch = min(max_stargazers // per_page + 1, last_page, 5)  # Cap at 5 pages (500 users)
-    start_page = max(1, last_page - pages_to_fetch + 1)
+    # Cap at GitHub's accessible limit
+    accessible_last_page = min(last_page, MAX_ACCESSIBLE_PAGE)
     
-    print(f"    Fetching pages {start_page} to {last_page}...")
+    if last_page > MAX_ACCESSIBLE_PAGE:
+        print(f"    ⚠️  Repo has {last_page} pages but GitHub only allows access to first {MAX_ACCESSIBLE_PAGE}")
     
-    for page in range(start_page, last_page + 1):
+    # Fetch the last N accessible pages to get the most recent stargazers we can access
+    pages_to_fetch = min(max_stargazers // per_page + 1, accessible_last_page, 5)
+    start_page = max(1, accessible_last_page - pages_to_fetch + 1)
+    
+    print(f"    Fetching pages {start_page} to {accessible_last_page}...")
+    
+    for page in range(start_page, accessible_last_page + 1):
         response = requests.get(
             url, 
             headers=get_headers(), 
@@ -97,7 +106,7 @@ def fetch_stargazers(repo: str, max_stargazers: int = 200) -> list[dict]:
         )
         
         if response.status_code == 403:
-            print(f"  ⚠️  Rate limited. Waiting 60 seconds...")
+            print(f"    ⚠️  Rate limited. Waiting 60 seconds...")
             time.sleep(60)
             response = requests.get(
                 url, 
@@ -105,21 +114,23 @@ def fetch_stargazers(repo: str, max_stargazers: int = 200) -> list[dict]:
                 params={"per_page": per_page, "page": page}
             )
         
+        if response.status_code == 422:
+            print(f"    ⚠️  Page {page} not accessible, trying lower page...")
+            # Try to back off to a lower page
+            continue
+        
         if response.status_code != 200:
-            print(f"  ❌ Error fetching page {page}: {response.status_code}")
+            print(f"    ❌ Error fetching page {page}: {response.status_code}")
             continue
         
         data = response.json()
         
         for user in data:
-            # Handle both formats (with and without starred_at)
             if isinstance(user, dict):
                 if "user" in user:
-                    # Format with starred_at
                     username = user["user"]["login"]
                     user_url = user["user"]["html_url"]
                 else:
-                    # Simple format
                     username = user.get("login")
                     user_url = user.get("html_url")
                 
@@ -132,9 +143,37 @@ def fetch_stargazers(repo: str, max_stargazers: int = 200) -> list[dict]:
         
         time.sleep(REQUEST_DELAY)
     
-    # Return the most recent ones (last in the list = most recent)
+    # If we got nothing from high pages, try the first few pages instead
+    if len(stargazers) == 0 and accessible_last_page > 5:
+        print(f"    Trying first pages instead...")
+        for page in range(1, 6):
+            response = requests.get(
+                url, 
+                headers=get_headers(), 
+                params={"per_page": per_page, "page": page}
+            )
+            
+            if response.status_code != 200:
+                continue
+            
+            data = response.json()
+            
+            for user in data:
+                if isinstance(user, dict):
+                    username = user.get("login")
+                    user_url = user.get("html_url")
+                    
+                    if username:
+                        stargazers.append({
+                            "username": username,
+                            "repo": repo,
+                            "user_url": user_url,
+                        })
+            
+            time.sleep(REQUEST_DELAY)
+    
     recent = stargazers[-max_stargazers:] if len(stargazers) > max_stargazers else stargazers
-    print(f"  ✓ Found {len(recent)} recent stargazers")
+    print(f"  ✓ Found {len(recent)} stargazers")
     return recent
 
 
