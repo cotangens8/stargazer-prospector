@@ -32,74 +32,110 @@ REPOS = [
 REQUEST_DELAY = 0.5  # seconds between requests
 
 
-def get_headers():
+def get_headers(include_starred_at: bool = False):
     """Get headers for GitHub API requests."""
     headers = {
-        "Accept": "application/vnd.github.v3.star+json",  # Includes starred_at timestamp
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    # The star+json accept header gives us starred_at timestamps
+    # but it changes the response format and can be unreliable
+    if include_starred_at:
+        headers["Accept"] = "application/vnd.github.star+json"
+    else:
+        headers["Accept"] = "application/vnd.github.v3+json"
+    
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return headers
 
 
-def fetch_stargazers(repo: str, since: datetime) -> list[dict]:
+def fetch_stargazers(repo: str, max_stargazers: int = 200) -> list[dict]:
     """
-    Fetch stargazers for a repo who starred after the given date.
-    Returns list of {username, starred_at, repo} dicts.
+    Fetch the most recent stargazers for a repo.
+    GitHub returns stargazers in chronological order (oldest first),
+    so we need to get the last pages to find recent ones.
+    
+    Returns list of {username, repo} dicts.
     """
     stargazers = []
-    page = 1
     per_page = 100
     
     print(f"  Fetching stargazers for {repo}...")
     
-    while True:
-        url = f"https://api.github.com/repos/{repo}/stargazers"
-        params = {"per_page": per_page, "page": page}
-        
-        response = requests.get(url, headers=get_headers(), params=params)
+    # First, get the total count by checking the last page
+    url = f"https://api.github.com/repos/{repo}/stargazers"
+    response = requests.get(url, headers=get_headers(), params={"per_page": 1, "page": 1})
+    
+    if response.status_code != 200:
+        print(f"  ❌ Error fetching {repo}: {response.status_code} - {response.text}")
+        return []
+    
+    # Parse Link header to find last page
+    link_header = response.headers.get("Link", "")
+    last_page = 1
+    
+    if 'rel="last"' in link_header:
+        # Parse: <https://api.github.com/repos/.../stargazers?page=XX>; rel="last"
+        import re
+        match = re.search(r'page=(\d+)>; rel="last"', link_header)
+        if match:
+            last_page = int(match.group(1))
+    
+    print(f"    Total pages: {last_page}")
+    
+    # Fetch the last N pages to get recent stargazers
+    pages_to_fetch = min(max_stargazers // per_page + 1, last_page, 5)  # Cap at 5 pages (500 users)
+    start_page = max(1, last_page - pages_to_fetch + 1)
+    
+    print(f"    Fetching pages {start_page} to {last_page}...")
+    
+    for page in range(start_page, last_page + 1):
+        response = requests.get(
+            url, 
+            headers=get_headers(), 
+            params={"per_page": per_page, "page": page}
+        )
         
         if response.status_code == 403:
             print(f"  ⚠️  Rate limited. Waiting 60 seconds...")
             time.sleep(60)
-            continue
+            response = requests.get(
+                url, 
+                headers=get_headers(), 
+                params={"per_page": per_page, "page": page}
+            )
         
         if response.status_code != 200:
-            print(f"  ❌ Error fetching {repo}: {response.status_code}")
-            break
+            print(f"  ❌ Error fetching page {page}: {response.status_code}")
+            continue
         
         data = response.json()
-        if not data:
-            break
         
-        for star in data:
-            starred_at_str = star.get("starred_at")
-            if starred_at_str:
-                starred_at = datetime.fromisoformat(starred_at_str.replace("Z", "+00:00"))
-                if starred_at >= since:
-                    stargazers.append({
-                        "username": star["user"]["login"],
-                        "starred_at": starred_at_str,
-                        "repo": repo,
-                        "user_url": star["user"]["html_url"],
-                    })
+        for user in data:
+            # Handle both formats (with and without starred_at)
+            if isinstance(user, dict):
+                if "user" in user:
+                    # Format with starred_at
+                    username = user["user"]["login"]
+                    user_url = user["user"]["html_url"]
                 else:
-                    # GitHub returns stargazers in reverse chronological order
-                    # Once we hit old stars, we can stop
-                    print(f"  ✓ Found {len(stargazers)} recent stargazers")
-                    return stargazers
+                    # Simple format
+                    username = user.get("login")
+                    user_url = user.get("html_url")
+                
+                if username:
+                    stargazers.append({
+                        "username": username,
+                        "repo": repo,
+                        "user_url": user_url,
+                    })
         
-        page += 1
         time.sleep(REQUEST_DELAY)
-        
-        # Safety limit
-        if page > 50:
-            print(f"  ⚠️  Hit page limit, stopping")
-            break
     
-    print(f"  ✓ Found {len(stargazers)} recent stargazers")
-    return stargazers
+    # Return the most recent ones (last in the list = most recent)
+    recent = stargazers[-max_stargazers:] if len(stargazers) > max_stargazers else stargazers
+    print(f"  ✓ Found {len(recent)} recent stargazers")
+    return recent
 
 
 def fetch_user_details(username: str) -> dict:
@@ -197,18 +233,18 @@ def dedupe_and_score(leads: list[dict]) -> list[dict]:
     Deduplicate by username and add a basic score.
     Higher score = more interesting lead.
     """
-    # Dedupe - keep the one with most info
+    # Dedupe - keep the one with most info, track all repos they starred
     by_username = {}
     for lead in leads:
         username = lead["username"]
         if username not in by_username:
+            lead["repos_starred"] = [lead["repo"]]
             by_username[username] = lead
         else:
-            # Merge repos they starred
+            # Add this repo to their list
             existing = by_username[username]
-            if "repos_starred" not in existing:
-                existing["repos_starred"] = [existing["repo"]]
-            existing["repos_starred"].append(lead["repo"])
+            if lead["repo"] not in existing["repos_starred"]:
+                existing["repos_starred"].append(lead["repo"])
     
     # Score
     scored = []
@@ -228,7 +264,7 @@ def dedupe_and_score(leads: list[dict]) -> list[dict]:
             score += 2
         
         # Multiple repos starred = high intent
-        repos_starred = lead.get("repos_starred", [lead["repo"]])
+        repos_starred = lead.get("repos_starred", [])
         score += (len(repos_starred) - 1) * 3
         
         # Some followers = established presence
@@ -239,7 +275,6 @@ def dedupe_and_score(leads: list[dict]) -> list[dict]:
             score += 1
         
         lead["score"] = score
-        lead["repos_starred"] = repos_starred
         scored.append(lead)
     
     # Sort by score descending
@@ -295,15 +330,15 @@ def main():
         print("⚠️  No GitHub token - limited to 60 requests/hour")
         print("  Set GITHUB_TOKEN env var for better rate limits")
     
-    # Calculate lookback date
-    since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-    print(f"\nLooking for stargazers since: {since.date()}")
+    # Configuration
+    max_per_repo = 200  # Get up to 200 most recent stargazers per repo
+    print(f"\nFetching up to {max_per_repo} recent stargazers per repo")
     print(f"Repos: {', '.join(REPOS)}")
     
     # Fetch stargazers from all repos
     all_stargazers = []
     for repo in REPOS:
-        stargazers = fetch_stargazers(repo, since)
+        stargazers = fetch_stargazers(repo, max_stargazers=max_per_repo)
         all_stargazers.extend(stargazers)
         time.sleep(REQUEST_DELAY)
     
